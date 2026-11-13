@@ -1,25 +1,61 @@
 name: clang-format check
-on: [push, pull_request]
+on:
+  push:
+    paths:
+      - 'VirtIO/**'
+      - 'NetKVM/**'
+      - 'viofs/**'
+      - 'vioserial/**'
+      - 'viosock/**'
+      - 'viostor/**'
+      - 'Balloon/**'
+      - 'viomem/**'
+      - 'viorng/**'
+      - 'vioinput/**'
+      - 'ivshmem/**'
+      - 'viogpu/**'
+      - '.github/workflows/clang-format.yml'
+  pull_request:
+    paths:
+      - 'VirtIO/**'
+      - 'NetKVM/**'
+      - 'viofs/**'
+      - 'vioserial/**'
+      - 'viosock/**'
+      - 'viostor/**'
+      - 'Balloon/**'
+      - 'viomem/**'
+      - 'viorng/**'
+      - 'vioinput/**'
+      - 'ivshmem/**'
+      - 'viogpu/**'
+      - '.github/workflows/clang-format.yml'
+  workflow_dispatch:
 
 jobs:
   clang-format:
     name: Code style check for ${{ matrix.path['check'] }}
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         path:
           - check: '.'
-            exclude: './VirtIO|./.*/.*trace.h|./NetKVM/Common/virtio_net.h|./NetKVM/linux/if_ether.h|./viofs/shared/fuse.h|./viofs/svc/scope_exit.h'
+            exclude: './VirtIO|./.*/.*trace.h|./NetKVM/Common/virtio_net.h|./NetKVM/linux/if_ether.h|./viofs/shared/fuse.h|./viofs/svc/scope_exit.h|./viogpu'
           - check: 'VirtIO'
             exclude: ''
+          - check: 'viogpu'
+            exclude: ''
+            style: '.clang-format'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run clang-format style check for C/C++ programs.
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y clang-format-16
-          bash Tools/clang-format-helper.sh check ${CHECK_PATH} "" ${EXCLUDE_REGEX}
+          bash Tools/clang-format-helper.sh check "${CHECK_PATH}" "${STYLE_FILE}" "${EXCLUDE_REGEX}"
         env:
           CHECK_PATH: ${{ matrix.path['check'] }}
           EXCLUDE_REGEX: ${{ matrix.path['exclude'] }}
+          STYLE_FILE: ${{ matrix.path['style'] }}

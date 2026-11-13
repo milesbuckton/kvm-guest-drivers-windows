@@ -52,13 +52,35 @@ typedef struct virtio_gpu_vbuffer
     char *resp_buf;
     int resp_size;
     LIST_ENTRY list_entry;
+    LIST_ENTRY ctrl_queue_entry;
+    LIST_ENTRY isr_stage_entry;
+    UINT isr_stage_len;
 
     void (*complete_cb)(void *ctx);
     void *complete_ctx;
 
     bool auto_release;
 } GPU_VBUFFER, *PGPU_VBUFFER;
+
+typedef struct viogpu_complete_ctx
+{
+    PGPU_VBUFFER vbuf;
+    void (*user_cb)(void *ctx);
+    void *user_ctx;
+    void *owner;
+} VIOGPU_COMPLETE_CTX, *PVIOGPU_COMPLETE_CTX;
 // #pragma pack()
+
+typedef BOOLEAN (*VIOGPU_SYNC_EXEC_ROUTINE)(void *ctx);
+
+class IVioGpuQueueSync
+{
+  public:
+    virtual ~IVioGpuQueueSync()
+    {
+    }
+    virtual BOOLEAN ExecuteSynchronized(VIOGPU_SYNC_EXEC_ROUTINE routine, void *routineCtx) = 0;
+};
 
 #define MAX_INLINE_CMD_SIZE  96
 #define MAX_INLINE_RESP_SIZE 24
@@ -112,6 +134,7 @@ class VioGpuMemSegment
   private:
     BOOLEAN m_bSystemMemory;
     BOOLEAN m_bMapped;
+    BOOLEAN m_bPagesLocked;
     PSCATTER_GATHER_LIST m_pSGList;
     PVOID m_pVAddr;
     PMDL m_pMdl;
@@ -186,7 +209,32 @@ class VioGpuQueue
     {
         if (m_pVirtQueue)
         {
-            virtqueue_kick_always(m_pVirtQueue);
+            //
+            // virtqueue_kick() asks the ring whether the host actually wants a
+            // notification before writing the notify register.  Every MMIO
+            // write out of a guest is a VM exit, so an unconditional kick
+            // costs roughly a microsecond whether or not anyone is listening.
+            //
+            // This used to be virtqueue_kick_always().  That was harmless when
+            // viogpu only carried modeset, cursor and the occasional resource
+            // op - a few kicks a second.  Once the same queue is used to
+            // submit 3D command streams it becomes about 3200 kicks per frame
+            // against 11 batches, and the exits measured 4.8 ms per frame,
+            // 22% of the frame, second only to the driver's own CPU time.
+            //
+            // Every other driver in this tree - netkvm, viostor, vioscsi,
+            // balloon, viorng, vioserial, viosock, viofs - already kicks this
+            // way; viogpu was the only caller of the unconditional form.
+            //
+            // Spelled out with the two inlines rather than virtqueue_kick(),
+            // which is a real function in VirtIOPCICommon.c - a file this
+            // driver does not build.  These two are inline in VirtIO.h and
+            // are what virtqueue_kick() does anyway.
+            //
+            if (virtqueue_kick_prepare(m_pVirtQueue))
+            {
+                virtqueue_kick_always(m_pVirtQueue);
+            }
         }
     }
     bool EnableInterrupt(void)
@@ -228,19 +276,77 @@ class CtrlQueue : public VioGpuQueue
     CtrlQueue() : VioGpuQueue()
     {
         m_FenceIdr = 0;
+        InitializeListHead(&m_CtrlQueueList);
+        KeInitializeSpinLock(&m_CtrlQueueSpinLock);
+        m_CtrlQueueFlushInProgress = 0;
+        m_CtrlQueueFlushRequested = 0;
+        m_CtrlQueueFullRequeues = 0;
     };
 
     PVOID AllocCmd(PGPU_VBUFFER *buf, int sz);
     PVOID AllocCmdResp(PGPU_VBUFFER *buf, int cmd_sz, PVOID resp_buf, int resp_sz);
 
-    UINT QueueBuffer(PGPU_VBUFFER buf);
+    UINT QueueBufferFenced(PGPU_VBUFFER vbuf);
     PGPU_VBUFFER DequeueBuffer(_Out_ UINT *len);
+    PGPU_VBUFFER DequeueBufferFromIsr(_Out_ UINT *len);
+    void SetSynchronizeExecution(IVioGpuQueueSync *syncExec)
+    {
+        m_SyncExec = syncExec;
+    }
+    UINT Flush();
 
     void CreateResource(UINT res_id, UINT format, UINT width, UINT height);
+    void CreateResource3D(UINT res_id, VIOGPU_RESOURCE_OPTIONS *options);
+
+    NTSTATUS CreateResourceBlob(UINT res_id,
+                                ULONGLONG size,
+                                ULONG blob_mem,
+                                ULONG blob_flags,
+                                ULONGLONG blob_id,
+                                UINT ctx_id,
+                                PGPU_MEM_ENTRY ents,
+                                UINT nents,
+                                void (*complete_cb)(void *),
+                                void *complete_ctx);
+    BOOLEAN ResourceMapBlob(UINT res_id, ULONGLONG offset, ULONG *map_info);
+    void ResourceUnmapBlob(UINT res_id);
     void DestroyResource(UINT id);
+    void CtxResource(bool attach, UINT ctx_id, UINT res_id);
+    NTSTATUS CtxResourceWait(UINT ctx_id, UINT res_id);
+
+    UINT SubmitCommand(void *cmdbuf,
+                       ULONG size,
+                       ULONG ctx_id,
+                       void (*complete_cb)(void *),
+                       void *complete_ctx,
+                       UCHAR ringIndex = 0);
+    UINT TransferHostCmd(bool to_host,
+                         ULONG res_id,
+                         VIOGPU_TRANSFER_CMD *options,
+                         void (*complete_cb)(void *),
+                         void *complete_ctx);
+
     void SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, UINT x, UINT y);
-    void ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y);
+    void SetScanoutBlob(UINT scan_id,
+                        UINT res_id,
+                        UINT width,
+                        UINT height,
+                        UINT x,
+                        UINT y,
+                        UINT format,
+                        UINT stride,
+                        UINT offset);
+    UINT ResFlush(UINT res_id,
+                  UINT width,
+                  UINT height,
+                  UINT x,
+                  UINT y,
+                  void (*complete_cb)(void *) = NULL,
+                  void *complete_ctx = NULL);
+    UINT SubmitNop(void (*complete_cb)(void *), void *complete_ctx, BOOLEAN fenced = FALSE);
     void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y);
+    void TransferToHost3D(UINT res_id, GPU_BOX *box);
+
     void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
     void DetachBacking(UINT id);
 
@@ -248,9 +354,35 @@ class CtrlQueue : public VioGpuQueue
     BOOLEAN AskDisplayInfo(PGPU_VBUFFER *buf);
     BOOLEAN AskEdidInfo(PGPU_VBUFFER *buf, UINT id);
     BOOLEAN GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid);
+    BOOLEAN AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx);
+    BOOLEAN AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_size, ULONG capset_version);
+
+    void CreateCtx(UINT ctx_id, UINT context_init);
+    void DestroyCtx(UINT ctx_id);
 
   private:
+    UINT AddBufferSerialized(VirtIOBufferDescriptor *sg,
+                             UINT outcnt,
+                             UINT incnt,
+                             PGPU_VBUFFER buf,
+                             BOOLEAN kickOnSuccess);
+    UINT SubmitBuffer(PGPU_VBUFFER buf);
+    UINT QueueBuffer(PGPU_VBUFFER buf);
+    // Submit vbuf and wait for the host reply. Five-second waits are repeated
+    // only to log stalled requests; a submitted request is never abandoned.
+    // STATUS_SUCCESS => caller owns vbuf; failure => vbuf was reclaimed.
+    NTSTATUS QueueSyncBuffer(PGPU_VBUFFER vbuf);
+
     volatile LONG m_FenceIdr;
+    LIST_ENTRY m_CtrlQueueList;
+    KSPIN_LOCK m_CtrlQueueSpinLock;
+    volatile LONG m_CtrlQueueFlushInProgress;
+    volatile LONG m_CtrlQueueFlushRequested;
+    // Count of transient "control vq full" re-stagings. Non-zero here means the
+    // queue is applying backpressure (packets staged, drained by a later Flush);
+    // it is NOT an error. Watch this to confirm how often the vq runs dry.
+    volatile LONG m_CtrlQueueFullRequeues;
+    IVioGpuQueueSync *m_SyncExec = NULL;
 };
 
 class CrsrQueue : public VioGpuQueue
