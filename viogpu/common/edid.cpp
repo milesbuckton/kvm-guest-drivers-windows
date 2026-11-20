@@ -213,7 +213,8 @@ bool GetStandardTimingResolution(PSTANDARD_TIMING_DESCRIPTOR desc, PVIOGPU_DISP_
 
 bool GetVICResolution(USHORT idx, PVIOGPU_DISP_MODE mode)
 {
-    if (idx < 128 && mode)
+    // VICs are 1-based; bound by the table actually present, not the VIC range.
+    if (idx >= 1 && (SIZE_T)idx <= RTL_NUMBER_OF(gpu_vic_mode_table) && mode)
     {
         *mode = gpu_vic_mode_table[idx - 1].Resolution;
         return true;

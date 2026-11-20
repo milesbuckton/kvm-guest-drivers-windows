@@ -434,13 +434,16 @@ NTSTATUS VioGpuDod::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_DEVI
     {
         return STATUS_GRAPHICS_CHILD_DESCRIPTOR_NOT_SUPPORTED;
     }
-    else if (pDeviceDescriptor->DescriptorOffset < EDID_RAW_BLOCK_SIZE)
+    else
     {
-        ULONG len = min(pDeviceDescriptor->DescriptorLength,
-                        (EDID_RAW_BLOCK_SIZE - pDeviceDescriptor->DescriptorOffset));
-        RtlCopyMemory(pDeviceDescriptor->DescriptorBuffer, (edid + pDeviceDescriptor->DescriptorOffset), len);
-        pDeviceDescriptor->DescriptorLength = len;
-        return STATUS_SUCCESS;
+        const ULONG edidSize = m_pHWDevice->GetEdidSize();
+        if (pDeviceDescriptor->DescriptorOffset < edidSize)
+        {
+            ULONG len = min(pDeviceDescriptor->DescriptorLength, (edidSize - pDeviceDescriptor->DescriptorOffset));
+            RtlCopyMemory(pDeviceDescriptor->DescriptorBuffer, (edid + pDeviceDescriptor->DescriptorOffset), len);
+            pDeviceDescriptor->DescriptorLength = len;
+            return STATUS_SUCCESS;
+        }
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -621,7 +624,7 @@ NTSTATUS VioGpuDod::StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_P
     // FIXME!!!
     if (m_MonitorPowerState > PowerDeviceD0)
     {
-        SetPowerState(TargetId, PowerDeviceD0, PowerActionNone);
+        SetPowerState(DISPLAY_ADAPTER_HW_ID, PowerDeviceD0, PowerActionNone);
     }
 
     m_pHWDevice->BlackOutScreen(&m_CurrentMode);
@@ -1910,7 +1913,10 @@ PAGED_CODE_SEG_END
 VOID VioGpuDod::DpcRoutine(VOID)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
-    m_pHWDevice->DpcRoutine(&m_DxgkInterface);
+    if (IsHardwareInit())
+    {
+        m_pHWDevice->DpcRoutine(&m_DxgkInterface);
+    }
     m_DxgkInterface.DxgkCbNotifyDpc((HANDLE)m_DxgkInterface.DeviceHandle);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
@@ -2309,6 +2315,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_CurrentModeIndex = 0;
     m_CustomModeIndex = 0;
     RtlZeroMemory(m_EDIDs, sizeof(m_EDIDs));
+    m_EdidSize = 0;
     m_bEDID = FALSE;
     m_ModeInfo = NULL;
     m_ModeCount = 0;
@@ -2521,6 +2528,19 @@ PBYTE VioGpuAdapter::GetEdidData()
     PAGED_CODE();
 
     return m_bEDID ? m_EDIDs : (PBYTE)(g_gpu_edid);
+}
+
+ULONG VioGpuAdapter::GetEdidSize()
+{
+    PAGED_CODE();
+    PBYTE edid = GetEdidData();
+    ULONG available = m_bEDID ? m_EdidSize : EDID_V1_BLOCK_SIZE;
+    if (available < EDID_V1_BLOCK_SIZE)
+    {
+        return 0;
+    }
+    ULONG announced = (static_cast<ULONG>(edid[126]) + 1) * EDID_V1_BLOCK_SIZE;
+    return min(available, announced);
 }
 
 PBYTE VioGpuAdapter::GetCTA861Data(void)
@@ -2989,6 +3009,12 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
         PGPU_VBUFFER vbuf;
         UINT ret = 0;
         crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
+        if (crsr == NULL)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s failed to allocate cursor command\n", __FUNCTION__));
+            KeReleaseGuardedMutex(&m_CursorMutex);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         RtlZeroMemory(crsr, sizeof(*crsr));
 
         crsr->hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
@@ -3057,6 +3083,12 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
             PGPU_VBUFFER vbuf;
             UINT ret = 0;
             crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
+            if (crsr == NULL)
+            {
+                DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s failed to allocate cursor command\n", __FUNCTION__));
+                KeReleaseGuardedMutex(&m_CursorMutex);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
             RtlZeroMemory(crsr, sizeof(*crsr));
 
             if (!visible)
@@ -3272,15 +3304,21 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
-    PGPU_VBUFFER vbuf = NULL;
-
-    for (UINT32 i = 0; i < m_u32NumScanouts; i++)
+    BOOLEAN found = FALSE;
+    for (UINT32 i = 0; i < m_u32NumScanouts && !found; i++)
     {
-        if (m_CtrlQueue.AskEdidInfo(&vbuf, i) && m_CtrlQueue.GetEdidInfo(vbuf, i, m_EDIDs))
+        PGPU_VBUFFER vbuf = NULL;
+        ULONG size = 0;
+        if (m_CtrlQueue.AskEdidInfo(&vbuf, i) && m_CtrlQueue.GetEdidInfo(vbuf, i, m_EDIDs, &size))
         {
+            m_EdidSize = size;
             m_bEDID = TRUE;
+            found = TRUE;
         }
-        m_CtrlQueue.ReleaseBuffer(vbuf);
+        if (vbuf)
+        {
+            m_CtrlQueue.ReleaseBuffer(vbuf);
+        }
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -3688,6 +3726,11 @@ void VioGpuAdapter::DestroyFrameBufferObj(BOOLEAN bReset, BOOLEAN bKeepBuffer)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
+static BOOLEAN InterruptCloseBarrier(PVOID)
+{
+    return TRUE;
+}
+
 void VioGpuAdapter::VioGpuAdapterClose()
 {
     DbgPrint(TRACE_LEVEL_FATAL, ("---> %s\n", __FUNCTION__));
@@ -3697,11 +3740,25 @@ void VioGpuAdapter::VioGpuAdapterClose()
         m_pVioGpuDod->SetHardwareInit(FALSE);
         m_CtrlQueue.DisableInterrupt();
         m_CursorQueue.DisableInterrupt();
+        // Stop the device first so no completion or interrupt can follow,
+        // then drain any ISR/DPC still in flight before the queues close.
+        virtio_device_reset(&m_VioDev);
         if (KeGetCurrentIrql() < DISPATCH_LEVEL)
         {
+            PDXGKRNL_INTERFACE pDxgkInterface = GetDxgkInterface();
+            const ULONG messageCount = m_PciResources.IsMSIEnabled() ? 3 : 1;
+            for (ULONG messageNumber = 0; messageNumber < messageCount; messageNumber++)
+            {
+                BOOLEAN callbackRet = FALSE;
+                pDxgkInterface->DxgkCbSynchronizeExecution(pDxgkInterface->DeviceHandle,
+                                                           InterruptCloseBarrier,
+                                                           NULL,
+                                                           messageNumber,
+                                                           &callbackRet);
+            }
             KeFlushQueuedDpcs();
         }
-        virtio_device_reset(&m_VioDev);
+        InterlockedExchange((PLONG)&m_PendingWorks, 0);
         virtio_delete_queues(&m_VioDev);
         m_CtrlQueue.Close();
         m_CursorQueue.Close();
@@ -3740,16 +3797,17 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ PDXGKRNL_INTERFACE pDxgkInterface, 
         UNREFERENCED_PARAMETER(MessageNumber);
         UCHAR isrstat = virtio_read_isr_status(&m_VioDev);
 
-        switch (isrstat)
+        if (isrstat & 0x1)
         {
-            case 1:
-                intReason = (ISR_REASON_DISPLAY | ISR_REASON_CURSOR);
-                break;
-            case 3:
-                intReason = ISR_REASON_CHANGE;
-                break;
-            default:
-                serviced = FALSE;
+            intReason |= (ISR_REASON_DISPLAY | ISR_REASON_CURSOR);
+        }
+        if (isrstat & 0x2)
+        {
+            intReason |= ISR_REASON_CHANGE;
+        }
+        if (intReason == 0)
+        {
+            serviced = FALSE;
         }
     }
 
@@ -3922,7 +3980,14 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
         return FALSE;
     }
 
-    GpuObjectAttach(resid, obj);
+    if (!GpuObjectAttach(resid, obj))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to attach gpu object\n", __FUNCTION__));
+        m_CtrlQueue.DestroyResource(resid);
+        m_Idr.PutId(resid);
+        delete obj;
+        return FALSE;
+    }
     m_CtrlQueue.SetScanout(0 /*FIXME m_Id*/, resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_CtrlQueue.TransferToHost2D(resid, 0, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
     m_CtrlQueue.ResFlush(resid, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, 0, 0);
@@ -4081,7 +4146,14 @@ BOOLEAN VioGpuAdapter::GpuObjectAttach(UINT res_id, VioGpuObj *obj)
         ents[i].padding = 0;
     }
 
-    m_CtrlQueue.AttachBacking(res_id, ents, sgl->NumberOfElements);
+    NTSTATUS status = m_CtrlQueue.AttachBacking(res_id, ents, sgl->NumberOfElements);
+    if (!NT_SUCCESS(status))
+    {
+        // AttachBacking owns ents and has already freed it.
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("<--- %s AttachBacking failed res_id = %d status = 0x%x\n", __FUNCTION__, res_id, status));
+        return FALSE;
+    }
     obj->SetId(res_id);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;

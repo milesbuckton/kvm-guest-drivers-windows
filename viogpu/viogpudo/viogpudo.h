@@ -150,6 +150,8 @@ class VioGpuAdapter : IVioGpuPCI
         return m_Id;
     }
     PBYTE GetEdidData(void);
+    // Valid bytes behind GetEdidData, bounded by the EDID's extension count.
+    ULONG GetEdidSize(void);
     PBYTE GetCTA861Data(void);
 
   protected:
@@ -189,6 +191,7 @@ class VioGpuAdapter : IVioGpuPCI
     USHORT m_CustomModeIndex;
     ULONG m_Id;
     BYTE m_EDIDs[EDID_RAW_BLOCK_SIZE];
+    ULONG m_EdidSize;
     BOOLEAN m_bEDID;
 
     VirtIODevice m_VioDev;
