@@ -1,0 +1,22 @@
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index f782177..3cce475 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -49,7 +49,7 @@
+ 
+ #include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+ 
+-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
++#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)) && !defined(_M_ARM64EC)
+ #include <emmintrin.h>
+ #endif
+ #include <stdlib.h>
+@@ -61,7 +61,7 @@
+ static void
+ CopyConstantPublication(void *dst, const void *src, size_t size)
+ {
+-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
++#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)) && !defined(_M_ARM64EC)
+    if (size >= CONSTANT_PUBLICATION_NONTEMPORAL_MIN_SIZE &&
+        !(reinterpret_cast<uintptr_t>(dst) & 15u) && !(size & 15u)) {
+       __m128i *dst_vec = reinterpret_cast<__m128i *>(dst);

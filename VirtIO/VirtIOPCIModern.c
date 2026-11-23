@@ -41,6 +41,7 @@
 #include "virtio_pci_common.h"
 #include "windows\virtio_ring_allocation.h"
 #include <stddef.h>
+#include <limits.h>
 
 #ifdef WPP_EVENT_TRACING
 #include "VirtIOPCIModern.tmh"
@@ -101,6 +102,54 @@ static void *vio_modern_map_simple_capability(VirtIODevice *vdev, int cap_offset
                                      0,           // offset
                                      (u32)length, // size is equal to minlen
                                      NULL);       // not interested in the full length
+}
+
+static void vio_modern_map_shared_memory_capability(VirtIODevice *vdev, int cap_offset)
+{
+    u8 bar = 0;
+    u8 shm_id = 0;
+    u32 off_lo = 0, off_hi = 0;
+    u32 len_lo = 0, len_hi = 0;
+    u64 offset = 0;
+    u64 length = 0;
+
+    DPrintf(0, "%s(%p)", __FUNCTION__, vdev);
+    pci_read_config_byte(vdev, cap_offset + offsetof(struct virtio_pci_cap, bar), &bar);
+    pci_read_config_byte(vdev, cap_offset + offsetof(struct virtio_pci_cap, id), &shm_id);
+    pci_read_config_dword(vdev, cap_offset + offsetof(struct virtio_pci_cap, offset), &off_lo);
+    pci_read_config_dword(vdev, cap_offset + offsetof(struct virtio_pci_cap, length), &len_lo);
+    pci_read_config_dword(vdev, cap_offset + offsetof(struct virtio_pci_cap64, offset_hi), &off_hi);
+    pci_read_config_dword(vdev, cap_offset + offsetof(struct virtio_pci_cap64, length_hi), &len_hi);
+
+    offset = ((u64)off_hi << 32) | off_lo;
+    length = ((u64)len_hi << 32) | len_lo;
+
+    if (!length) {
+        return;
+    }
+
+    if (offset > SIZE_MAX || length > SIZE_MAX || offset > SIZE_MAX - length) {
+        DPrintf(0, "shared memory capability too large (offset=%I64u length=%I64u)\n", offset,
+                length);
+        return;
+    }
+
+    if (bar >= PCI_TYPE0_ADDRESSES) {
+        DPrintf(0, "shared memory capability uses invalid BAR %u\n", bar);
+        return;
+    }
+
+    if (offset + length > pci_get_resource_len(vdev, bar)) {
+        DPrintf(0,
+                "BAR %u is not large enough for shared memory region (offset=%I64u length=%I64u)\n",
+                bar, offset, length);
+        return;
+    }
+
+    vdev->shmem_len = length;
+    vdev->shmem_offset = offset;
+    vdev->shmem_bar = bar;
+    vdev->shmem_id = shm_id;
 }
 
 static void vio_modern_get_config(VirtIODevice *vdev, unsigned offset, void *buf, unsigned len)
@@ -484,6 +533,7 @@ static u8 find_first_pci_vendor_capability(VirtIODevice *vdev)
 static void find_pci_vendor_capabilities(VirtIODevice *vdev, int *Offsets, size_t nOffsets)
 {
     u8 offset = find_first_pci_vendor_capability(vdev);
+    BOOLEAN shmem_host_visible = FALSE;
     while (offset > 0) {
         u8 cfg_type, bar;
         pci_read_config_byte(vdev, offset + offsetof(struct virtio_pci_cap, cfg_type), &cfg_type);
@@ -491,7 +541,19 @@ static void find_pci_vendor_capabilities(VirtIODevice *vdev, int *Offsets, size_
 
         if (bar < PCI_TYPE0_ADDRESSES && cfg_type < nOffsets &&
             pci_get_resource_len(vdev, bar) > 0) {
-            Offsets[cfg_type] = offset;
+            if (cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) {
+                /* A device may expose several shared memory regions. Prefer
+                 * the first one with the host-visible ID, else the first one. */
+                u8 shm_id = 0;
+                pci_read_config_byte(vdev, offset + offsetof(struct virtio_pci_cap, id), &shm_id);
+                if (!Offsets[cfg_type] ||
+                    (shm_id == VIRTIO_PCI_SHM_ID_HOST_VISIBLE && !shmem_host_visible)) {
+                    Offsets[cfg_type] = offset;
+                    shmem_host_visible = shm_id == VIRTIO_PCI_SHM_ID_HOST_VISIBLE;
+                }
+            } else {
+                Offsets[cfg_type] = offset;
+            }
         }
 
         offset =
@@ -502,13 +564,19 @@ static void find_pci_vendor_capabilities(VirtIODevice *vdev, int *Offsets, size_
 /* Modern device initialization */
 NTSTATUS vio_modern_initialize(VirtIODevice *vdev)
 {
-    int capabilities[VIRTIO_PCI_CAP_PCI_CFG];
-
+    int capabilities[VIRTIO_PCI_CAP_MAX];
     u32 notify_length;
     u32 notify_offset;
 
     RtlZeroMemory(capabilities, sizeof(capabilities));
-    find_pci_vendor_capabilities(vdev, capabilities, VIRTIO_PCI_CAP_PCI_CFG);
+
+    vdev->shmem_base = NULL;
+    vdev->shmem_len = 0;
+    vdev->shmem_offset = 0;
+    vdev->shmem_bar = 0;
+    vdev->shmem_id = 0;
+
+    find_pci_vendor_capabilities(vdev, capabilities, VIRTIO_PCI_CAP_MAX);
 
     /* Check for a common config, if not found use legacy mode */
     if (!capabilities[VIRTIO_PCI_CAP_COMMON_CFG]) {
@@ -573,6 +641,11 @@ NTSTATUS vio_modern_initialize(VirtIODevice *vdev)
         if (!vdev->config) {
             return STATUS_INVALID_PARAMETER;
         }
+    }
+
+    if (capabilities[VIRTIO_PCI_CAP_SHARED_MEMORY_CFG]) {
+        vio_modern_map_shared_memory_capability(vdev,
+                                                capabilities[VIRTIO_PCI_CAP_SHARED_MEMORY_CFG]);
     }
 
     vdev->device = &virtio_pci_device_ops;
